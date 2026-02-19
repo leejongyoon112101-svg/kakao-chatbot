@@ -27,6 +27,66 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="17호 민원처리 챗봇")
 
 # ============================================================
+# 유저별 대화 기억 (최근 5턴 저장)
+# ============================================================
+
+CHAT_HISTORY_FILE = "chat_history.json"
+MAX_AI_CONTEXT = 5  # AI에게 보내는 최근 대화 수 (비용/속도 관리)
+
+
+def load_chat_history() -> dict:
+    """전체 대화 기록 로드"""
+    try:
+        if os.path.exists(CHAT_HISTORY_FILE):
+            with open(CHAT_HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"대화 기록 로드 실패: {e}")
+    return {}
+
+
+def save_chat_history(history: dict):
+    """전체 대화 기록 저장"""
+    try:
+        with open(CHAT_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"대화 기록 저장 실패: {e}")
+
+
+def get_user_messages(user_id: str) -> list:
+    """유저의 최근 대화를 Claude API 형식으로 반환 (최근 MAX_AI_CONTEXT턴만)"""
+    history = load_chat_history()
+    user_history = history.get(user_id, [])
+    
+    # 최근 N턴만 AI에게 전달 (전체는 보관)
+    recent = user_history[-MAX_AI_CONTEXT:]
+    
+    messages = []
+    for turn in recent:
+        messages.append({"role": "user", "content": turn["user"]})
+        messages.append({"role": "assistant", "content": turn["assistant"]})
+    
+    return messages
+
+
+def add_to_history(user_id: str, user_message: str, ai_response: str):
+    """유저 대화 기록에 새 턴 추가 (전체 보관, 삭제 안 함)"""
+    history = load_chat_history()
+    
+    if user_id not in history:
+        history[user_id] = []
+    
+    history[user_id].append({
+        "user": user_message,
+        "assistant": ai_response,
+        "timestamp": datetime.now().isoformat()
+    })
+    
+    save_chat_history(history)
+
+
+# ============================================================
 # 건물 정보 & 민원 지식베이스
 # ============================================================
 
@@ -60,21 +120,28 @@ SYSTEM_PROMPT = f"""당신은 건물 관리 AI 도우미입니다.
 
 
 async def get_ai_response(user_message: str, user_id: str = "") -> dict:
-    """Claude API로 민원 응답 생성"""
+    """Claude API로 민원 응답 생성 (이전 대화 기억 포함)"""
     
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     
     try:
+        # 이전 대화 불러오기
+        previous_messages = get_user_messages(user_id)
+        
+        # 이전 대화 + 새 메시지
+        messages = previous_messages + [{"role": "user", "content": user_message}]
+        
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
             system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": user_message}
-            ]
+            messages=messages
         )
         
         ai_text = response.content[0].text
+        
+        # 대화 기록 저장
+        add_to_history(user_id, user_message, ai_text)
         
         is_urgent = "[긴급]" in ai_text or any(
             keyword in user_message 
@@ -345,6 +412,36 @@ async def get_urgent_complaints():
         return {"total": 0, "logs": []}
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/admin/history")
+async def get_chat_history():
+    """전체 유저 대화 기록 조회 (요약)"""
+    history = load_chat_history()
+    summary = {
+        uid: {"total_turns": len(turns), "first": turns[0]["timestamp"] if turns else "", "last": turns[-1]["timestamp"] if turns else ""}
+        for uid, turns in history.items()
+    }
+    return {"total_users": len(history), "users": summary}
+
+
+@app.get("/admin/history/{user_id}")
+async def get_user_chat_history(user_id: str):
+    """특정 유저 전체 대화 기록 조회"""
+    history = load_chat_history()
+    user_history = history.get(user_id, [])
+    return {"user_id": user_id, "total_turns": len(user_history), "history": user_history}
+
+
+@app.delete("/admin/history/{user_id}")
+async def clear_user_chat_history(user_id: str):
+    """퇴실 시 유저 대화 기록 삭제"""
+    history = load_chat_history()
+    if user_id in history:
+        del history[user_id]
+        save_chat_history(history)
+        return {"message": f"유저 {user_id} 대화 기록 삭제 완료"}
+    return {"message": "해당 유저 기록 없음"}
 
 
 @app.get("/health")
