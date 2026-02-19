@@ -336,11 +336,12 @@ async def kakao_skill_complaint(request: Request):
     if not user_message:
         return make_kakao_response("무엇을 도와드릴까요? 😊")
     
-    # 봇 일시정지 상태면 → 무응답 (관리자가 직접 상담 중)
+    # 봇 일시정지 상태면 → 완전 무응답 (관리자가 직접 상담 중)
     if is_user_paused(user_id):
         logger.info(f"봇 일시정지 중 - 유저: {user_id}, 메시지: {user_message}")
-        # 로그만 기록하고 빈 응답 (관리자가 직접 답변)
-        return make_kakao_response("현재 관리자가 직접 상담 중입니다. 잠시만 기다려 주세요 🙏")
+        # 의도적으로 지연시켜 타임아웃 유도 → 카카오가 아무 메시지도 안 보냄
+        await asyncio.sleep(6)
+        return JSONResponse(content={"version": "2.0", "template": {"outputs": []}})
     
     # 콜백 URL이 있으면 → 콜백 방식 (즉시 응답 + 백그라운드 처리)
     if callback_url:
