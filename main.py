@@ -91,22 +91,38 @@ def add_to_history(user_id: str, user_message: str, ai_response: str):
 # ============================================================
 
 # ============================================================
-# 학습 데이터 로드 (knowledge.json)
+# 학습 데이터 로드 (knowledge/ 폴더)
 # ============================================================
 
-KNOWLEDGE_FILE = "knowledge.json"
+KNOWLEDGE_DIR = "knowledge"
 
 
 def load_knowledge() -> str:
-    """knowledge.json에서 학습 데이터를 읽어 텍스트로 변환"""
+    """knowledge/ 폴더의 모든 JSON 파일을 읽어 텍스트로 변환"""
     try:
-        if os.path.exists(KNOWLEDGE_FILE):
-            with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return _format_knowledge(data)
+        if not os.path.exists(KNOWLEDGE_DIR):
+            return "(등록된 건물 정보가 없습니다)"
+        
+        all_text = []
+        # 파일명 순서대로 정렬 (01_, 02_, 03_ ...)
+        files = sorted([f for f in os.listdir(KNOWLEDGE_DIR) if f.endswith(".json")])
+        
+        for filename in files:
+            filepath = os.path.join(KNOWLEDGE_DIR, filename)
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                all_text.append(_format_knowledge(data))
+            except Exception as e:
+                logger.error(f"학습 데이터 로드 실패 ({filename}): {e}")
+        
+        if all_text:
+            return "\n\n".join(all_text)
+        return "(등록된 건물 정보가 없습니다)"
+        
     except Exception as e:
-        logger.error(f"학습 데이터 로드 실패: {e}")
-    return "(등록된 건물 정보가 없습니다)"
+        logger.error(f"학습 데이터 폴더 로드 실패: {e}")
+        return "(등록된 건물 정보가 없습니다)"
 
 
 def _format_knowledge(data: dict, indent: int = 0) -> str:
@@ -637,12 +653,19 @@ async def resume_user_bot(user_id: str):
 
 @app.get("/admin/knowledge")
 async def get_knowledge():
-    """현재 학습 데이터 조회"""
+    """현재 학습 데이터 전체 조회"""
     try:
-        if os.path.exists(KNOWLEDGE_FILE):
-            with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return {"message": "knowledge.json 파일 없음"}
+        if not os.path.exists(KNOWLEDGE_DIR):
+            return {"message": "knowledge 폴더 없음"}
+        
+        result = {}
+        files = sorted([f for f in os.listdir(KNOWLEDGE_DIR) if f.endswith(".json")])
+        for filename in files:
+            filepath = os.path.join(KNOWLEDGE_DIR, filename)
+            with open(filepath, "r", encoding="utf-8") as f:
+                result[filename] = json.load(f)
+        
+        return {"total_files": len(files), "files": list(files), "data": result}
     except Exception as e:
         return {"error": str(e)}
 
