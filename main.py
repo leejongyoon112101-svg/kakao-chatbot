@@ -90,9 +90,36 @@ def add_to_history(user_id: str, user_message: str, ai_response: str):
 # 건물 정보 & 민원 지식베이스
 # ============================================================
 
-BUILDING_KNOWLEDGE = """
-(여기에 건물 정보를 추가하세요)
-"""
+# ============================================================
+# 학습 데이터 로드 (knowledge.json)
+# ============================================================
+
+KNOWLEDGE_FILE = "knowledge.json"
+
+
+def load_knowledge() -> str:
+    """knowledge.json에서 학습 데이터를 읽어 텍스트로 변환"""
+    try:
+        if os.path.exists(KNOWLEDGE_FILE):
+            with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return _format_knowledge(data)
+    except Exception as e:
+        logger.error(f"학습 데이터 로드 실패: {e}")
+    return "(등록된 건물 정보가 없습니다)"
+
+
+def _format_knowledge(data: dict, indent: int = 0) -> str:
+    """중첩 JSON을 읽기 좋은 텍스트로 변환"""
+    lines = []
+    prefix = "  " * indent
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.append(f"{prefix}[{key}]")
+            lines.append(_format_knowledge(value, indent + 1))
+        else:
+            lines.append(f"{prefix}- {key}: {value}")
+    return "\n".join(lines)
 
 # ============================================================
 # 봇 일시정지 관리 (직접 상담 모드)
@@ -145,7 +172,10 @@ def resume_user(user_id: str):
 # Claude AI 응답 생성
 # ============================================================
 
-SYSTEM_PROMPT = f"""당신은 다가구주택 건물 관리 AI 도우미입니다.
+def get_system_prompt() -> str:
+    """시스템 프롬프트 생성 (매번 최신 knowledge.json 반영)"""
+    knowledge = load_knowledge()
+    return f"""당신은 다가구주택 건물 관리 AI 도우미입니다.
 입주민의 민원과 질문을 접수하고 대응합니다.
 
 ## ⚠️ 절대 원칙 (반드시 지키세요)
@@ -186,7 +216,7 @@ SYSTEM_PROMPT = f"""당신은 다가구주택 건물 관리 AI 도우미입니�
 누수, 물이 새, 침수, 화재, 불, 연기, 가스 냄새, 가스 누출, 정전, 문 안 열림, 잠김, 도둑, 침입
 
 ## 건물 정보
-{BUILDING_KNOWLEDGE}
+{knowledge}
 """
 
 
@@ -205,7 +235,7 @@ async def get_ai_response(user_message: str, user_id: str = "") -> dict:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=500,
-            system=SYSTEM_PROMPT,
+            system=get_system_prompt(),
             messages=messages
         )
         
@@ -604,6 +634,18 @@ async def resume_user_bot(user_id: str):
 # ============================================================
 # 관리자용 데이터 엔드포인트
 # ============================================================
+
+@app.get("/admin/knowledge")
+async def get_knowledge():
+    """현재 학습 데이터 조회"""
+    try:
+        if os.path.exists(KNOWLEDGE_FILE):
+            with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {"message": "knowledge.json 파일 없음"}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 @app.get("/admin/logs")
 async def get_complaint_logs():
