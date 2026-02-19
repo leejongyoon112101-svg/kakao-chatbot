@@ -1,15 +1,16 @@
 """
-카카오톡 채널 AI 민원처리 스킬서버
-- 카카오 오픈빌더 스킬(Skill) 연동
-- Anthropic Claude API로 자연어 민원 처리
-- 긴급 민원 시 임대인에게 알림
+카카오톡 채널 AI 민원처리 스킬서버 (콜백 방식)
+- 즉시 "확인했습니다" 응답 → 백그라운드에서 AI 처리 → 콜백으로 실제 답변 전송
+- 5초 타임아웃 문제 완전 해결
 """
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import anthropic
+import httpx
 import json
 import os
+import asyncio
 from datetime import datetime
 import logging
 
@@ -17,13 +18,9 @@ import logging
 # 설정
 # ============================================================
 
-# Anthropic API 키 (환경변수로 관리)
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "your-api-key-here")
+OWNER_NOTIFY_URL = os.getenv("OWNER_NOTIFY_URL", "")
 
-# 임대인 알림 설정 (긴급 민원 시)
-OWNER_NOTIFY_URL = os.getenv("OWNER_NOTIFY_URL", "")  # 카카오톡 나에게 보내기 API 등
-
-# 로깅 설정
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -70,7 +67,7 @@ async def get_ai_response(user_message: str, user_id: str = "") -> dict:
     try:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=150,
+            max_tokens=500,
             system=SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": user_message}
@@ -79,7 +76,6 @@ async def get_ai_response(user_message: str, user_id: str = "") -> dict:
         
         ai_text = response.content[0].text
         
-        # 긴급 여부 판단
         is_urgent = "[긴급]" in ai_text or any(
             keyword in user_message 
             for keyword in ["누수", "물이 새", "침수", "화재", "불이", "연기", "가스", "정전"]
@@ -135,39 +131,121 @@ def log_complaint(user_id: str, message: str, response: str, is_urgent: bool):
 
 
 # ============================================================
-# 카카오 오픈빌더 스킬 엔드포인트
+# 콜백으로 AI 응답 전송 (백그라운드)
+# ============================================================
+
+async def process_and_callback(callback_url: str, user_message: str, user_id: str):
+    """백그라운드에서 AI 응답 생성 후 카카오 콜백으로 전송"""
+    try:
+        # AI 응답 생성 (시간 제한 없음)
+        ai_result = await get_ai_response(user_message, user_id)
+        
+        # 민원 로그 저장
+        log_complaint(user_id, user_message, ai_result["text"], ai_result["is_urgent"])
+        
+        # 긴급 민원 알림
+        if ai_result["is_urgent"]:
+            logger.warning(f"⚠️ 긴급 민원 발생! 사용자: {user_id}, 내용: {user_message}")
+        
+        # 콜백 응답 포맷
+        callback_response = {
+            "version": "2.0",
+            "template": {
+                "outputs": [
+                    {
+                        "simpleText": {
+                            "text": ai_result["text"]
+                        }
+                    }
+                ],
+                "quickReplies": [
+                    {
+                        "messageText": "긴급 연락처",
+                        "action": "message",
+                        "label": "🚨 긴급연락처"
+                    },
+                    {
+                        "messageText": "건물 안내",
+                        "action": "message",
+                        "label": "🏠 건물안내"
+                    },
+                    {
+                        "messageText": "보일러 문제",
+                        "action": "message",
+                        "label": "🔧 보일러"
+                    },
+                    {
+                        "messageText": "수도 문제",
+                        "action": "message",
+                        "label": "💧 수도"
+                    }
+                ]
+            }
+        }
+        
+        # 카카오 콜백 URL로 응답 전송
+        async with httpx.AsyncClient() as http_client:
+            result = await http_client.post(
+                callback_url,
+                json=callback_response,
+                timeout=10.0
+            )
+            logger.info(f"콜백 전송 완료: {result.status_code}")
+            
+    except Exception as e:
+        logger.error(f"콜백 처리 실패: {e}")
+
+
+# ============================================================
+# 카카오 오픈빌더 스킬 엔드포인트 (콜백 방식)
 # ============================================================
 
 @app.post("/skill/complaint")
 async def kakao_skill_complaint(request: Request):
     """
-    카카오 오픈빌더 스킬 엔드포인트
+    카카오 오픈빌더 스킬 엔드포인트 (콜백 방식)
     
-    오픈빌더에서 이 URL을 스킬로 등록하면,
-    입주민의 메시지가 이 서버로 전달되고 AI 응답이 반환됩니다.
+    1. 즉시 "확인했습니다" 응답 반환 (1초 이내)
+    2. 백그라운드에서 AI 처리
+    3. 콜백 URL로 실제 답변 전송
     """
     
     body = await request.json()
     logger.info(f"수신된 요청: {json.dumps(body, ensure_ascii=False)}")
     
-    # 카카오 오픈빌더 요청에서 사용자 발화 추출
     user_message = body.get("userRequest", {}).get("utterance", "")
     user_id = body.get("userRequest", {}).get("user", {}).get("id", "unknown")
+    callback_url = body.get("userRequest", {}).get("callbackUrl", "")
     
     if not user_message:
         return make_kakao_response("무엇을 도와드릴까요? 😊")
     
-    # AI 응답 생성
-    ai_result = await get_ai_response(user_message, user_id)
+    # 콜백 URL이 있으면 → 콜백 방식 (즉시 응답 + 백그라운드 처리)
+    if callback_url:
+        # 백그라운드에서 AI 처리 시작
+        asyncio.create_task(process_and_callback(callback_url, user_message, user_id))
+        
+        # 즉시 응답 반환 (useCallback: true)
+        return JSONResponse(content={
+            "version": "2.0",
+            "useCallback": True,
+            "template": {
+                "outputs": [
+                    {
+                        "simpleText": {
+                            "text": "확인했습니다! 잠시만 기다려 주세요 😊"
+                        }
+                    }
+                ]
+            }
+        })
     
-    # 민원 로그 저장
+    # 콜백 URL이 없으면 → 직접 응답 (기존 방식)
+    ai_result = await get_ai_response(user_message, user_id)
     log_complaint(user_id, user_message, ai_result["text"], ai_result["is_urgent"])
     
-    # 긴급 민원 시 임대인 알림 (별도 구현 필요)
     if ai_result["is_urgent"]:
         logger.warning(f"⚠️ 긴급 민원 발생! 사용자: {user_id}, 내용: {user_message}")
-        # TODO: 임대인에게 카카오톡/문자 알림 전송
-        # await notify_owner(user_id, user_message)
     
     return make_kakao_response(ai_result["text"])
 
@@ -175,25 +253,21 @@ async def kakao_skill_complaint(request: Request):
 @app.post("/skill/info")
 async def kakao_skill_info(request: Request):
     """건물 기본 정보 안내 스킬"""
-    
     info_text = """🏠 건물 관리 도우미입니다.
 
 💬 궁금한 점은 편하게 물어보세요! 😊"""
-    
     return make_kakao_response(info_text)
 
 
 @app.post("/skill/emergency")
 async def kakao_skill_emergency(request: Request):
     """긴급 연락처 안내 스킬"""
-    
     emergency_text = """🚨 긴급 연락처
 
 🔥 화재/응급: 119
 🚔 범죄/소음: 112
 💧 수도 긴급: 120
 ⛽ 가스 긴급: 1588-5788"""
-    
     return make_kakao_response(emergency_text)
 
 
@@ -202,11 +276,6 @@ async def kakao_skill_emergency(request: Request):
 # ============================================================
 
 def make_kakao_response(text: str, quick_replies: list = None):
-    """
-    카카오 오픈빌더 스킬 응답 JSON 포맷
-    https://i.kakao.com/docs/skill-response-format
-    """
-    
     response = {
         "version": "2.0",
         "template": {
@@ -220,11 +289,9 @@ def make_kakao_response(text: str, quick_replies: list = None):
         }
     }
     
-    # 바로가기 버튼 추가 (선택)
     if quick_replies:
         response["template"]["quickReplies"] = quick_replies
     else:
-        # 기본 바로가기 버튼
         response["template"]["quickReplies"] = [
             {
                 "messageText": "긴급 연락처",
@@ -257,7 +324,6 @@ def make_kakao_response(text: str, quick_replies: list = None):
 
 @app.get("/admin/logs")
 async def get_complaint_logs():
-    """민원 로그 조회 (관리자용)"""
     try:
         if os.path.exists(COMPLAINT_LOG_FILE):
             with open(COMPLAINT_LOG_FILE, "r", encoding="utf-8") as f:
@@ -270,7 +336,6 @@ async def get_complaint_logs():
 
 @app.get("/admin/urgent")
 async def get_urgent_complaints():
-    """긴급 민원만 조회"""
     try:
         if os.path.exists(COMPLAINT_LOG_FILE):
             with open(COMPLAINT_LOG_FILE, "r", encoding="utf-8") as f:
@@ -284,7 +349,6 @@ async def get_urgent_complaints():
 
 @app.get("/health")
 async def health_check():
-    """서버 상태 확인"""
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
