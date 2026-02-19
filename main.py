@@ -5,7 +5,7 @@
 """
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 import anthropic
 import httpx
 import json
@@ -95,24 +95,95 @@ BUILDING_KNOWLEDGE = """
 """
 
 # ============================================================
+# 봇 일시정지 관리 (직접 상담 모드)
+# ============================================================
+
+PAUSED_USERS_FILE = "paused_users.json"
+
+
+def load_paused_users() -> dict:
+    """일시정지된 유저 목록 로드"""
+    try:
+        if os.path.exists(PAUSED_USERS_FILE):
+            with open(PAUSED_USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"일시정지 목록 로드 실패: {e}")
+    return {}
+
+
+def save_paused_users(paused: dict):
+    """일시정지된 유저 목록 저장"""
+    try:
+        with open(PAUSED_USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(paused, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"일시정지 목록 저장 실패: {e}")
+
+
+def is_user_paused(user_id: str) -> bool:
+    """유저가 일시정지(직접상담 모드)인지 확인"""
+    paused = load_paused_users()
+    return user_id in paused
+
+
+def pause_user(user_id: str):
+    """유저 봇 일시정지 (직접상담 모드 전환)"""
+    paused = load_paused_users()
+    paused[user_id] = {"paused_at": datetime.now().isoformat()}
+    save_paused_users(paused)
+
+
+def resume_user(user_id: str):
+    """유저 봇 다시 활성화"""
+    paused = load_paused_users()
+    if user_id in paused:
+        del paused[user_id]
+        save_paused_users(paused)
+
+# ============================================================
 # Claude AI 응답 생성
 # ============================================================
 
-SYSTEM_PROMPT = f"""당신은 건물 관리 AI 도우미입니다.
-입주민의 민원과 질문에 친절하고 실용적으로 답변합니다.
+SYSTEM_PROMPT = f"""당신은 다가구주택 건물 관리 AI 도우미입니다.
+입주민의 민원과 질문을 접수하고 대응합니다.
+
+## ⚠️ 절대 원칙 (반드시 지키세요)
+1. 확실하지 않은 정보는 절대 말하지 마세요
+2. 건물 정보에 없는 내용은 추측하지 마세요
+3. 수리비, 보상, 계약 조건 등 책임이 따르는 답변은 하지 마세요
+4. 모르는 것은 "관리자에게 확인 후 안내드리겠습니다"로 답하세요
+5. 당신은 AI 도우미일 뿐이며, 최종 결정권은 임대인(관리자)에게 있음을 명시하세요
+
+## 대응 원칙
+
+### 1단계: 분류
+입주민 메시지를 아래 중 하나로 분류하세요:
+- 긴급: 누수, 화재, 가스, 정전, 침입 등 즉시 조치 필요
+- 시설: 보일러, 수도, 전기, 엘리베이터 등 시설물 문제
+- 생활: 소음, 주차, 쓰레기, 벌레 등 생활 불편
+- 문의: 관리비, 계약, 일정 등 정보 요청
+- 기타: 위에 해당하지 않는 것
+
+### 2단계: 대응
+- 긴급 → [긴급] 태그 + 안전 확보 안내 + 임대인 연락 안내
+- 시설 → 자가 점검 방법 안내 → 안 되면 "관리자에게 전달하겠습니다" 안내
+- 생활 → 해결 방법 안내 → 필요 시 "관리자에게 전달하겠습니다" 안내
+- 문의 → 건물 정보에 있으면 답변, 없으면 "관리자에게 확인 후 안내드리겠습니다"
+- 기타 → 최대한 도움 제공, 모르면 "관리자에게 전달하겠습니다"
+
+### 3단계: 후속 확인
+- 문제 해결 여부를 물어보세요
+- 추가로 필요한 것이 있는지 확인하세요
 
 ## 답변 규칙
-1. 짧고 명확하게 답변 (카카오톡 메시지이므로 간결하게, 최대 300자)
-2. 이모지를 적절히 활용
-3. 자가 해결 가능하면 단계별 안내
-4. 긴급 상황이면 [긴급] 태그를 붙이고 임대인 연락 안내
-5. 등록된 정보가 없는 내용은 임대인에게 문의하라고 안내
-6. 존댓말 사용
+- 카카오톡 메시지이므로 간결하게 (최대 300자)
+- 이모지 적절히 활용
+- 존댓말 사용
+- 이전 대화 맥락을 반영하여 답변
 
-## 긴급 상황 판단 기준
-다음 키워드가 포함되면 긴급으로 분류:
-- 누수, 물이 새, 침수, 화재, 불, 연기, 가스 냄새, 가스 누출
-- 정전, 문 안 열림, 잠김, 도둑, 침입
+## 긴급 판단 키워드
+누수, 물이 새, 침수, 화재, 불, 연기, 가스 냄새, 가스 누출, 정전, 문 안 열림, 잠김, 도둑, 침입
 
 ## 건물 정보
 {BUILDING_KNOWLEDGE}
@@ -224,28 +295,6 @@ async def process_and_callback(callback_url: str, user_message: str, user_id: st
                             "text": ai_result["text"]
                         }
                     }
-                ],
-                "quickReplies": [
-                    {
-                        "messageText": "긴급 연락처",
-                        "action": "message",
-                        "label": "🚨 긴급연락처"
-                    },
-                    {
-                        "messageText": "건물 안내",
-                        "action": "message",
-                        "label": "🏠 건물안내"
-                    },
-                    {
-                        "messageText": "보일러 문제",
-                        "action": "message",
-                        "label": "🔧 보일러"
-                    },
-                    {
-                        "messageText": "수도 문제",
-                        "action": "message",
-                        "label": "💧 수도"
-                    }
                 ]
             }
         }
@@ -286,6 +335,12 @@ async def kakao_skill_complaint(request: Request):
     
     if not user_message:
         return make_kakao_response("무엇을 도와드릴까요? 😊")
+    
+    # 봇 일시정지 상태면 → 무응답 (관리자가 직접 상담 중)
+    if is_user_paused(user_id):
+        logger.info(f"봇 일시정지 중 - 유저: {user_id}, 메시지: {user_message}")
+        # 로그만 기록하고 빈 응답 (관리자가 직접 답변)
+        return make_kakao_response("현재 관리자가 직접 상담 중입니다. 잠시만 기다려 주세요 🙏")
     
     # 콜백 URL이 있으면 → 콜백 방식 (즉시 응답 + 백그라운드 처리)
     if callback_url:
@@ -356,37 +411,197 @@ def make_kakao_response(text: str, quick_replies: list = None):
         }
     }
     
+    # 버튼이 명시적으로 전달된 경우에만 추가
     if quick_replies:
         response["template"]["quickReplies"] = quick_replies
-    else:
-        response["template"]["quickReplies"] = [
-            {
-                "messageText": "긴급 연락처",
-                "action": "message",
-                "label": "🚨 긴급연락처"
-            },
-            {
-                "messageText": "건물 안내",
-                "action": "message",
-                "label": "🏠 건물안내"
-            },
-            {
-                "messageText": "보일러 문제",
-                "action": "message",
-                "label": "🔧 보일러"
-            },
-            {
-                "messageText": "수도 문제",
-                "action": "message",
-                "label": "💧 수도"
-            }
-        ]
     
     return JSONResponse(content=response)
 
 
 # ============================================================
-# 관리자용 엔드포인트
+# 관리자 웹 페이지 (핸드폰에서 접속)
+# ============================================================
+
+ADMIN_HTML = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>민원 챗봇 관리</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, sans-serif; background: #f5f5f5; padding: 16px; }
+        h1 { font-size: 20px; margin-bottom: 16px; color: #333; }
+        h2 { font-size: 16px; margin: 20px 0 10px; color: #555; }
+        .card { background: white; border-radius: 12px; padding: 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .user-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid #eee; }
+        .user-row:last-child { border-bottom: none; }
+        .user-id { font-size: 13px; color: #666; word-break: break-all; flex: 1; margin-right: 10px; }
+        .user-last { font-size: 11px; color: #999; }
+        .btn { padding: 8px 16px; border: none; border-radius: 8px; font-size: 14px; font-weight: bold; cursor: pointer; min-width: 70px; }
+        .btn-pause { background: #ff6b6b; color: white; }
+        .btn-resume { background: #51cf66; color: white; }
+        .btn-pause:active { background: #e55a5a; }
+        .btn-resume:active { background: #40c057; }
+        .status { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
+        .status-bot { background: #d3f9d8; color: #2b8a3e; }
+        .status-human { background: #ffe3e3; color: #c92a2a; }
+        .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 16px; }
+        .stat-box { background: white; border-radius: 12px; padding: 16px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .stat-num { font-size: 28px; font-weight: bold; color: #333; }
+        .stat-label { font-size: 12px; color: #888; margin-top: 4px; }
+        .empty { color: #999; text-align: center; padding: 20px; font-size: 14px; }
+        .refresh-btn { display: block; width: 100%; padding: 12px; background: #228be6; color: white; border: none; border-radius: 12px; font-size: 16px; font-weight: bold; cursor: pointer; margin-top: 16px; }
+    </style>
+</head>
+<body>
+    <h1>🏠 민원 챗봇 관리</h1>
+    
+    <div class="stats">
+        <div class="stat-box">
+            <div class="stat-num" id="totalUsers">-</div>
+            <div class="stat-label">전체 유저</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-num" id="pausedCount">-</div>
+            <div class="stat-label">직접상담 중</div>
+        </div>
+    </div>
+
+    <h2>💬 직접상담 중 (봇 꺼짐)</h2>
+    <div class="card" id="pausedList">
+        <div class="empty">직접상담 중인 유저가 없습니다</div>
+    </div>
+
+    <h2>🤖 봇 활성 유저</h2>
+    <div class="card" id="activeList">
+        <div class="empty">로딩 중...</div>
+    </div>
+
+    <button class="refresh-btn" onclick="loadData()">🔄 새로고침</button>
+
+    <script>
+        async function loadData() {
+            try {
+                const [historyRes, pausedRes] = await Promise.all([
+                    fetch('/admin/history'),
+                    fetch('/admin/paused')
+                ]);
+                const history = await historyRes.json();
+                const paused = await pausedRes.json();
+                
+                const pausedIds = new Set(Object.keys(paused.paused_users || {}));
+                const users = history.users || {};
+                
+                document.getElementById('totalUsers').textContent = history.total_users || 0;
+                document.getElementById('pausedCount').textContent = pausedIds.size;
+                
+                // 직접상담 중 목록
+                let pausedHtml = '';
+                for (const [uid, info] of Object.entries(users)) {
+                    if (pausedIds.has(uid)) {
+                        const shortId = uid.substring(0, 12) + '...';
+                        pausedHtml += `
+                            <div class="user-row">
+                                <div>
+                                    <div class="user-id">${shortId}</div>
+                                    <div class="user-last">대화 ${info.total_turns}건</div>
+                                    <span class="status status-human">직접상담</span>
+                                </div>
+                                <button class="btn btn-resume" onclick="resumeBot('${uid}')">봇 켜기</button>
+                            </div>`;
+                    }
+                }
+                // paused에 있지만 history에 없는 유저도 표시
+                for (const uid of pausedIds) {
+                    if (!users[uid]) {
+                        const shortId = uid.substring(0, 12) + '...';
+                        pausedHtml += `
+                            <div class="user-row">
+                                <div>
+                                    <div class="user-id">${shortId}</div>
+                                    <span class="status status-human">직접상담</span>
+                                </div>
+                                <button class="btn btn-resume" onclick="resumeBot('${uid}')">봇 켜기</button>
+                            </div>`;
+                    }
+                }
+                document.getElementById('pausedList').innerHTML = pausedHtml || '<div class="empty">직접상담 중인 유저가 없습니다</div>';
+                
+                // 봇 활성 목록
+                let activeHtml = '';
+                for (const [uid, info] of Object.entries(users)) {
+                    if (!pausedIds.has(uid)) {
+                        const shortId = uid.substring(0, 12) + '...';
+                        const lastTime = info.last ? new Date(info.last).toLocaleString('ko-KR') : '';
+                        activeHtml += `
+                            <div class="user-row">
+                                <div>
+                                    <div class="user-id">${shortId}</div>
+                                    <div class="user-last">${lastTime} · ${info.total_turns}건</div>
+                                    <span class="status status-bot">봇 활성</span>
+                                </div>
+                                <button class="btn btn-pause" onclick="pauseBot('${uid}')">상담</button>
+                            </div>`;
+                    }
+                }
+                document.getElementById('activeList').innerHTML = activeHtml || '<div class="empty">활성 유저가 없습니다</div>';
+                
+            } catch (e) {
+                console.error(e);
+            }
+        }
+        
+        async function pauseBot(userId) {
+            if (!confirm('이 유저의 봇을 끄고 직접 상담하시겠습니까?')) return;
+            await fetch('/admin/pause/' + encodeURIComponent(userId), { method: 'POST' });
+            loadData();
+        }
+        
+        async function resumeBot(userId) {
+            if (!confirm('이 유저의 봇을 다시 켜시겠습니까?')) return;
+            await fetch('/admin/resume/' + encodeURIComponent(userId), { method: 'POST' });
+            loadData();
+        }
+        
+        loadData();
+    </script>
+</body>
+</html>
+"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    """관리자 웹 페이지"""
+    return ADMIN_HTML
+
+
+@app.get("/admin/paused")
+async def get_paused_users():
+    """일시정지된 유저 목록 조회"""
+    return {"paused_users": load_paused_users()}
+
+
+@app.post("/admin/pause/{user_id}")
+async def pause_user_bot(user_id: str):
+    """유저 봇 일시정지 (직접상담 모드)"""
+    pause_user(user_id)
+    logger.info(f"🔴 봇 일시정지: {user_id}")
+    return {"message": f"봇 일시정지 완료 - 직접상담 모드", "user_id": user_id}
+
+
+@app.post("/admin/resume/{user_id}")
+async def resume_user_bot(user_id: str):
+    """유저 봇 다시 활성화"""
+    resume_user(user_id)
+    logger.info(f"🟢 봇 재활성화: {user_id}")
+    return {"message": f"봇 재활성화 완료", "user_id": user_id}
+
+
+# ============================================================
+# 관리자용 데이터 엔드포인트
 # ============================================================
 
 @app.get("/admin/logs")
