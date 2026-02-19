@@ -70,7 +70,7 @@ async def get_ai_response(user_message: str, user_id: str = "") -> dict:
     try:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=500,
+            max_tokens=150,
             system=SYSTEM_PROMPT,
             messages=[
                 {"role": "user", "content": user_message}
